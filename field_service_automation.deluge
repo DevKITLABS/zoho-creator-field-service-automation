@@ -1,0 +1,241 @@
+requestId = input.Request_ID;
+
+serviceRequest = Service_Requests[ID == requestId];
+
+if(serviceRequest.count() == 0)
+{
+	info "Request not found";
+	return;
+}
+
+customerName = ifnull(serviceRequest.Customer_Name,"");
+customerId = serviceRequest.Customer;
+serviceType = ifnull(serviceRequest.Service_Type,"");
+priority = ifnull(serviceRequest.Priority,"Low");
+location = ifnull(serviceRequest.City,"");
+productType = ifnull(serviceRequest.Product_Type,"");
+issueCategory = ifnull(serviceRequest.Issue_Category,"");
+requestStatus = ifnull(serviceRequest.Status,"Open");
+preferredDate = serviceRequest.Preferred_Service_Date;
+createdTime = serviceRequest.Created_Time;
+
+riskScore = 0;
+slaHours = 24;
+assignedTech = null;
+inventoryAvailable = true;
+repeatIssue = false;
+validationErrors = List();
+
+// PRIORITY CALCULATION
+
+if(priority == "Critical")
+{
+	riskScore = riskScore + 50;
+	slaHours = 4;
+}
+
+else if(priority == "High")
+{
+	riskScore = riskScore + 30;
+	slaHours = 8;
+}
+
+else if(priority == "Medium")
+{
+	riskScore = riskScore + 15;
+	slaHours = 12;
+}
+
+// REPEAT ISSUE DETECTION
+
+previousRequests = Service_Requests
+[
+	Customer == customerId
+	&& Issue_Category == issueCategory
+	&& ID != requestId
+];
+
+if(previousRequests.count() >= 2)
+{
+	repeatIssue = true;
+	riskScore = riskScore + 25;
+}
+
+// INVENTORY VALIDATION
+
+requiredInventory = Inventory
+[
+	Product_Type == productType
+];
+
+if(requiredInventory.count() > 0)
+{
+	for each item in requiredInventory
+	{
+		if(item.Available_Stock <= 0)
+		{
+			inventoryAvailable = false;
+			validationErrors.add("Inventory shortage for " + item.Item_Name);
+		}
+	}
+}
+
+// TECHNICIAN FILTERING
+
+availableTechs = Technicians
+[
+	Service_City == location
+	&& Status == "Available"
+];
+
+leastLoad = 99999;
+
+for each tech in availableTechs
+{
+	openJobs = Service_Requests
+	[
+		Assigned_Technician == tech.ID
+		&& Status != "Completed"
+	];
+
+	jobCount = openJobs.count();
+
+	if(jobCount < leastLoad)
+	{
+		leastLoad = jobCount;
+		assignedTech = tech;
+	}
+}
+
+// TECHNICIAN ASSIGNMENT
+
+if(assignedTech != null)
+{
+	serviceRequest.Assigned_Technician = assignedTech.ID;
+	serviceRequest.Assignment_Status = "Assigned";
+	serviceRequest.Assigned_Time = zoho.currenttime;
+
+	assignedTech.Current_Workload = leastLoad + 1;
+}
+
+// SLA DEADLINE
+
+deadline = createdTime.addHour(slaHours);
+
+serviceRequest.SLA_Deadline = deadline;
+
+if(zoho.currenttime > deadline)
+{
+	serviceRequest.SLA_Status = "Breached";
+
+	insert into Escalations
+	[
+		Request_ID = requestId
+		Escalation_Type = "SLA Breach"
+		Severity = "High"
+		Status = "Open"
+	]
+}
+else
+{
+	serviceRequest.SLA_Status = "Within SLA";
+}
+
+// CUSTOMER PRIORITY
+
+customerData = Customers[ID == customerId];
+
+if(customerData.count() > 0)
+{
+	if(customerData.Customer_Type == "Enterprise")
+	{
+		riskScore = riskScore + 20;
+	}
+
+	if(customerData.AMC_Status == "Expired")
+	{
+		validationErrors.add("AMC expired");
+	}
+}
+
+// REPEAT ISSUE ESCALATION
+
+if(repeatIssue == true)
+{
+	insert into Escalations
+	[
+		Request_ID = requestId
+		Escalation_Type = "Repeat Complaint"
+		Severity = "Medium"
+		Status = "Pending"
+	]
+}
+
+// INVOICE ELIGIBILITY
+
+if(requestStatus == "Completed")
+{
+	if(inventoryAvailable == true && validationErrors.isEmpty())
+	{
+		serviceRequest.Invoice_Status = "Ready";
+	}
+	else
+	{
+		serviceRequest.Invoice_Status = "On Hold";
+	}
+}
+
+// SERVICE AUDIT LOG
+
+insert into Service_Audit_Logs
+[
+	Request_ID = requestId
+	Customer_Name = customerName
+	Service_Type = serviceType
+	Priority = priority
+	Risk_Score = riskScore
+	Repeat_Issue = repeatIssue
+	Inventory_Available = inventoryAvailable
+	Assigned_Technician = ifnull(assignedTech.Name,"")
+	Status = requestStatus
+]
+
+// FINAL STATUS LOGIC
+
+if(validationErrors.size() > 0)
+{
+	serviceRequest.Internal_Status = "Validation Failed";
+	serviceRequest.Validation_Remarks = validationErrors.toString();
+}
+else
+{
+	serviceRequest.Internal_Status = "Validated";
+}
+
+// AUTO ESCALATION FOR HIGH RISK
+
+if(riskScore >= 60)
+{
+	insert into Escalations
+	[
+		Request_ID = requestId
+		Escalation_Type = "High Risk Service Request"
+		Severity = "Critical"
+		Status = "Open"
+	]
+}
+
+// CUSTOMER NOTIFICATION
+
+if(assignedTech != null)
+{
+	sendmail
+	[
+		from : zoho.adminuserid
+		to : customerData.Email
+		subject : "Service Request Assigned"
+		message : "Your service request has been assigned to technician " + assignedTech.Name
+	]
+}
+
+info "Field Service Automation Executed";
